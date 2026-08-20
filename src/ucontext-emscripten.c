@@ -177,6 +177,10 @@ static int uc_state_is_ready(const ucontext_t *ucp)
  * user_data; we recover the caller's function and its makecontext() arguments
  * and call it.
  *
+ * It is deliberately not static.  php-wasm links with an Asyncify only-list,
+ * which instruments a function only if the build can name it, and the name of
+ * a static function is the optimizer's to change.
+ *
  * POSIX says that when that function returns, execution continues in uc_link,
  * or the thread exits if uc_link is NULL.  PHP always sets uc_link to NULL
  * and its fiber entry point never returns, so the honest thing to do on
@@ -184,7 +188,7 @@ static int uc_state_is_ready(const ucontext_t *ucp)
  * there is not — exactly what POSIX asks for, and what a mistake here should
  * look like rather than silently running on a dead stack.
  */
-static void uc_trampoline(void *arg)
+void emscripten_ucontext_trampoline(void *arg)
 {
 	ucontext_t *ucp = (ucontext_t *)arg;
 	uc_state_t *state = UC_STATE(ucp);
@@ -311,7 +315,7 @@ void makecontext(ucontext_t *ucp, void (*func)(void), int argc, ...)
 	asyncify_size &= ~(size_t)15; /* keep both stacks 16-byte aligned */
 	c_size = total - asyncify_size;
 
-	emscripten_fiber_init(&state->fiber, uc_trampoline, ucp,
+	emscripten_fiber_init(&state->fiber, emscripten_ucontext_trampoline, ucp,
 		stack, c_size, stack + c_size, asyncify_size);
 	state->fiber_ptr = &state->fiber;
 

@@ -26,6 +26,16 @@
 extern "C" {
 #endif
 
+/*
+ * The function every fiber starts in.  It is not part of POSIX and nothing
+ * should call it; it has external linkage and a name of its own only so that
+ * the build can name it in Asyncify's only-list.  A build that instruments
+ * only the functions it lists — which is what php-wasm does, to keep the
+ * download down — has to be able to say "instrument this one", and a static
+ * function the optimizer is free to rename cannot be said.
+ */
+void emscripten_ucontext_trampoline(void *arg);
+
 int getcontext(ucontext_t *ucp);
 void makecontext(ucontext_t *ucp, void (*func)(void), int argc, ...);
 int setcontext(const ucontext_t *ucp);

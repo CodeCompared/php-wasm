@@ -6,3 +6,6 @@ dist/
 build/
 *.log
 .DS_Store
+
+# Probe output
+probe-results*.json

@@ -1,0 +1,17 @@
+{
+  "name": "php-wasm-fibers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Making PHP Fibers work in the in-browser php-wasm build, and closing the other gaps",
+  "license": "GPL-2.0-or-later",
+  "scripts": {
+    "check:prototype": "scripts/check-prototype.sh",
+    "probe:published": "node test/probe/run-probes.mjs --target published",
+    "probe:local": "node test/probe/run-probes.mjs --target local",
+    "test": "scripts/check-prototype.sh && node test/probe/run-probes.mjs --target published"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  }
+}
