@@ -235,38 +235,93 @@ export const probes = [
 
 	{
 		name: 'network-file-get-contents',
-		what: 'an https read fails in a way PHP code can handle',
-		code: `<?php
-			$result = @file_get_contents('https://example.com');
-			echo $result === false ? 'returned false' : 'returned ' . strlen($result) . ' bytes';
-		`,
-		expect: (r) => r.text.includes('returned false'),
+		what: 'an https read fails without taking the runtime with it',
+		/*
+		 * What is being asked of these three is recoverability, not a
+		 * particular return value. There is no network transport in a plain
+		 * web build, so none of them can succeed; the question is whether
+		 * they fail the way PHP code already handles -- false, a warning, an
+		 * error string -- or trap on `unreachable`, which cannot be caught
+		 * from PHP and ends the run.
+		 *
+		 * So each probe runs the call, then runs a second statement. The
+		 * second statement is the real assertion: after a trap there is no
+		 * second statement.
+		 *
+		 * default_socket_timeout is turned down because the default is sixty
+		 * seconds, and waiting out a minute per probe proves nothing that
+		 * five seconds does not.
+		 */
+		runs: [
+			`<?php
+				ini_set('default_socket_timeout', '5');
+				$result = @file_get_contents('https://example.com');
+				echo 'result=', var_export($result, true), "\n";
+			`,
+			`<?php echo "still alive: ", 2 + 2;`,
+		],
+		expect: (r) =>
+			r.runs?.[1]?.text?.includes('still alive: 4') &&
+			!r.text.includes('unreachable'),
 		known: 'traps: Aborted(unreachable), taking the runtime with it',
+		report: (r) => ({
+			returned: (r.runs?.[0]?.text ?? r.runs?.[0]?.error ?? '').trim().slice(0, 80),
+			instanceSurvived: Boolean(r.runs?.[1]?.text),
+		}),
 	},
 
 	{
 		name: 'network-fsockopen',
-		what: 'a socket connection fails in a way PHP code can handle',
-		code: `<?php
-			$handle = @fsockopen('example.com', 80, $errno, $errstr, 1);
-			echo $handle === false ? "returned false ($errno)" : 'opened a socket';
-		`,
-		expect: (r) => r.text.includes('returned false'),
+		what: 'a socket connection fails without taking the runtime with it',
+		runs: [
+			`<?php
+				ini_set('default_socket_timeout', '5');
+				$handle = @fsockopen('example.com', 80, $errno, $errstr, 5);
+				if ($handle === false) {
+					echo "result=false errno=$errno\n";
+				} else {
+					// The connection is not waited for, so failure shows up
+					// at the first read rather than at connect().
+					$read = @fread($handle, 16);
+					echo 'result=handle read=', var_export($read, true), "\n";
+					@fclose($handle);
+				}
+			`,
+			`<?php echo "still alive: ", 2 + 2;`,
+		],
+		expect: (r) =>
+			r.runs?.[1]?.text?.includes('still alive: 4') &&
+			!r.text.includes('unreachable'),
 		known: 'traps: Aborted(unreachable)',
+		report: (r) => ({
+			returned: (r.runs?.[0]?.text ?? r.runs?.[0]?.error ?? '').trim().slice(0, 80),
+			instanceSurvived: Boolean(r.runs?.[1]?.text),
+		}),
 	},
 
 	{
 		name: 'network-curl',
-		what: 'curl_exec fails in a way PHP code can handle',
-		code: `<?php
-			$handle = curl_init('https://example.com');
-			curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
-			curl_setopt($handle, CURLOPT_TIMEOUT, 2);
-			$result = curl_exec($handle);
-			echo $result === false ? 'returned false: ' . curl_error($handle) : 'fetched something';
-		`,
-		expect: (r) => r.text.includes('returned false'),
+		what: 'curl_exec fails without taking the runtime with it',
+		runs: [
+			`<?php
+				$handle = curl_init('https://example.com');
+				curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
+				curl_setopt($handle, CURLOPT_TIMEOUT, 5);
+				curl_setopt($handle, CURLOPT_CONNECTTIMEOUT, 5);
+				$result = curl_exec($handle);
+				echo 'result=', var_export($result, true),
+					' error=', curl_error($handle) ?: '(none)', "\n";
+			`,
+			`<?php echo "still alive: ", 2 + 2;`,
+		],
+		expect: (r) =>
+			r.runs?.[1]?.text?.includes('still alive: 4') &&
+			!r.text.includes('unreachable'),
 		known: 'traps: Aborted(unreachable), although the curl extension is loaded',
+		report: (r) => ({
+			returned: (r.runs?.[0]?.text ?? r.runs?.[0]?.error ?? '').trim().slice(0, 80),
+			instanceSurvived: Boolean(r.runs?.[1]?.text),
+		}),
 	},
 
 	{

@@ -1,0 +1,296 @@
+From 475b8e8bdc4b58367a4906de02a1c640ab7ab1d1 Mon Sep 17 00:00:00 2001
+From: Brandon Zylstra <brandon.zylstra@gmail.com>
+Date: Thu, 20 Aug 2026 00:14:44 -0400
+Subject: [PATCH 2/3] =?UTF-8?q?=F0=9F=9B=9F=20Make=20network=20and=20proce?=
+ =?UTF-8?q?ss=20failures=20recoverable=20instead=20of=20fatal?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three failures that PHP code cannot catch, because none of them is a PHP
+error -- they end the run, and one of them ends the browser tab.
+
+popen() killed the browsing context. js_popen_to_file runs inside
+Asyncify.handleSleep, where the WebAssembly stack has already been unwound
+and wakeUp() is what rewinds it; returning a value instead does nothing at
+all. The SPAWN_UNSUPPORTED path -- the path a plain web build always takes,
+because a browser has no processes -- returned 1 and never called wakeUp, so
+the runtime stayed unwound forever and the page died holding a promise that
+could never settle. The browser reports that as the evaluation promise being
+garbage collected, which reads like a bug in the caller.
+
+Every path out now calls wakeUp exactly once, including a new handler for a
+spawn that fails after returning, and wasm_popen checks for the null it can
+now receive rather than calling fopen() on a path built from the address 1.
+popen() returns false with a warning, which is what popen(3) does and what
+PHP code already handles.
+
+Every connect() trapped, and only in Chrome. Which branch to take is a
+question about the binary -- Asyncify or JSPI -- and it was answered by
+asking the browser, testing "Suspending" in WebAssembly. That agreed with the
+truth only for as long as no browser shipped JSPI. Chrome has since shipped
+it, so an Asyncify build running in Chrome takes the branch written for JSPI
+builds, which unwinds the stack in a place an Asyncify build cannot, and
+fsockopen(), https:// streams and curl_exec() all trap on "unreachable". The
+same binary in Firefox or Safari still fails gracefully, because those
+browsers still answer no -- so this is not a long-standing limitation of the
+WebAssembly build but a regression that arrived in Chrome, in a binary that
+had not changed. ASYNCIFY is a build setting and answers the question that
+was actually being asked.
+
+errno was never set. ___errno_location() *returns* the address of errno; all
+six call sites passed the code to it as an argument, which sets nothing, so a
+failure meant to reach PHP as ENOSYS or EBADF arrived as whatever errno
+happened to hold from earlier. There is a helper now that writes through the
+returned pointer.
+
+Measured in headless Chromium against a build from this tree, PHP 8.5.8
+asyncify: file_get_contents() on https returns false, curl_exec() returns
+false with curl_error() reading 'Failed to connect to example.com port 443:
+Connection refused', popen() returns false, and the PHP instance answers
+normally afterwards in every case. fsockopen() still returns a handle rather
+than false -- the synchronous path does not wait for the connection, so the
+failure surfaces at the first read; that is what Firefox and Safari have
+always done here, and it is recoverable, which an abort is not.
+
+Costs 5,252 bytes of WebAssembly, 0.025%.
+---
+ packages/php-wasm/compile/php/php_wasm.c      | 56 +++++++++++++++--
+ .../compile/php/phpwasm-emscripten-library.js | 61 ++++++++++++++++---
+ 2 files changed, 104 insertions(+), 13 deletions(-)
+
+diff --git a/packages/php-wasm/compile/php/php_wasm.c b/packages/php-wasm/compile/php/php_wasm.c
+index ea3e527..adbda94 100644
+--- a/packages/php-wasm/compile/php/php_wasm.c
++++ b/packages/php-wasm/compile/php/php_wasm.c
+@@ -94,6 +94,13 @@ EM_JS(char*, js_popen_to_file, (const char *command, const char *mode, uint8_t *
+ 	}
+ 
+ 	return returnCallback(async (wakeUp) => {
++		// Every path out of here must call wakeUp exactly once. Under
++		// Asyncify the WebAssembly stack has already been unwound by the
++		// time this runs, and wakeUp is what rewinds it; returning a value
++		// instead does nothing at all. A path that forgets leaves the
++		// runtime unwound forever -- the browser reports it as the
++		// evaluation promise being garbage collected, which reads like a
++		// bug in the caller and kills the whole page.
+ 		let cp;
+ 		try {
+ 			cp = PHPWASM.spawnProcess(cmdstr, []);
+@@ -101,11 +108,18 @@ EM_JS(char*, js_popen_to_file, (const char *command, const char *mode, uint8_t *
+ 				cp = await cp;
+ 			}
+ 		} catch (e) {
+-			console.error(e);
++			// No process support on this instance. Report it the way POSIX
++			// does, as a null FILE* with errno set, so popen() returns false
++			// and PHP code can take its else branch.
+ 			if (e.code === 'SPAWN_UNSUPPORTED') {
+-				return 1;
++				HEAPU8[exitCodePtr] = 127;
++				wakeUp(0);
++				return;
+ 			}
+-			throw e;
++			console.error(e);
++			HEAPU8[exitCodePtr] = 127;
++			wakeUp(0);
++			return;
+ 		}
+ 
+ 		const outByteArrays = [];
+@@ -113,6 +127,14 @@ EM_JS(char*, js_popen_to_file, (const char *command, const char *mode, uint8_t *
+ 			outByteArrays.push(data);
+ 		});
+ 
++		// A spawn handler that fails after returning would otherwise never
++		// reach the 'exit' handler below, and never wake the runtime up.
++		cp.on('error', function (error) {
++			console.error(error);
++			HEAPU8[exitCodePtr] = 127;
++			wakeUp(0);
++		});
++
+ 		const outputPath = '/tmp/popen_output';
+ 		cp.on('exit', function (exitCode) {
+ 			// Concat outByteArrays, an array of UInt8Arrays
+@@ -500,8 +522,20 @@ EMSCRIPTEN_KEEPALIVE FILE *wasm_popen(const char *cmd, const char *mode)
+ 	FILE *fp;
+ 	if (*mode == 'r')
+ 	{
+-		uint8_t last_exit_code;
++		uint8_t last_exit_code = 0;
+ 		char *file_path = js_popen_to_file(cmd, mode, &last_exit_code);
++		if (!file_path)
++		{
++			// No process support on this instance. Fail the way popen(3)
++			// fails so that PHP returns false and the calling code can
++			// handle it; anything else here has to be a crash, because the
++			// next line would open a path built from a null pointer.
++			php_error_docref(NULL, E_WARNING,
++				"popen(): spawning processes is not supported on this PHP build");
++			FG(pclose_ret) = -1;
++			errno = ENOSYS;
++			return NULL;
++		}
+ 		fp = fopen(file_path, mode);
+ 		FG(pclose_ret) = last_exit_code;
+ 	}
+@@ -557,6 +591,20 @@ EMSCRIPTEN_KEEPALIVE FILE *wasm_popen(const char *cmd, const char *mode)
+ 			0,
+ 			0
+ 		);
++		if (pid < 0)
++		{
++			php_error_docref(NULL, E_WARNING,
++				"popen(): spawning processes is not supported on this PHP build");
++			fclose(fp);
++			efree(stdin);
++			efree(stdout);
++			efree(stderr);
++			efree(descv);
++			FG(pclose_ret) = -1;
++			errno = ENOSYS;
++			return NULL;
++		}
++
+ 		js_popen_set_pid_for_fd(fileno(fp), pid);
+ 
+ 		efree(stdin);
+diff --git a/packages/php-wasm/compile/php/phpwasm-emscripten-library.js b/packages/php-wasm/compile/php/phpwasm-emscripten-library.js
+index ba57b40..d60e000 100644
+--- a/packages/php-wasm/compile/php/phpwasm-emscripten-library.js
++++ b/packages/php-wasm/compile/php/phpwasm-emscripten-library.js
+@@ -9,7 +9,7 @@
+ 
+ const LibraryExample = {
+ 	// Emscripten dependencies:
+-	$PHPWASM__deps: ['$allocateUTF8OnStack', '$addOnInit'],
++	$PHPWASM__deps: ['$allocateUTF8OnStack', '$addOnInit', '__errno_location'],
+ 	$PHPWASM__postset: 'PHPWASM.init();',
+ 
+ 	// Functions not exposed to C but available in the generated
+@@ -546,6 +546,21 @@ const LibraryExample = {
+ 			throw e;
+ 		},
+ 
++		/**
++		 * Sets the C `errno` variable.
++		 *
++		 * ___errno_location() *returns* the address of errno; it does not
++		 * take a value. Every call site here used to pass the code as an
++		 * argument, which set nothing at all, so a failure that was supposed
++		 * to surface in PHP as a specific error surfaced as whatever errno
++		 * happened to hold from before.
++		 *
++		 * @param {int} code One of ERRNO_CODES.
++		 */
++		setErrNo: function (code) {
++			HEAP32[___errno_location() >> 2] = code;
++		},
++
+ 		/**
+ 		 * Shims unix shutdown(2) functionality for asynchronous sockets:
+ 		 * https://man7.org/linux/man-pages/man2/shutdown.2.html
+@@ -601,13 +616,13 @@ const LibraryExample = {
+ 		envLength
+ 	) {
+ 		if (!command) {
+-			___errno_location(ERRNO_CODES.EINVAL);
++			PHPWASM.setErrNo(ERRNO_CODES.EINVAL);
+ 			return -1;
+ 		}
+ 
+ 		const cmdstr = UTF8ToString(command);
+ 		if (!cmdstr.length) {
+-			___errno_location(ERRNO_CODES.EINVAL);
++			PHPWASM.setErrNo(ERRNO_CODES.EINVAL);
+ 			return -1;
+ 		}
+ 
+@@ -671,11 +686,11 @@ const LibraryExample = {
+ 				}
+ 			} catch (e) {
+ 				if (e.code === 'SPAWN_UNSUPPORTED') {
+-					___errno_location(ERRNO_CODES.ENOSYS);
++					PHPWASM.setErrNo(ERRNO_CODES.ENOSYS);
+ 					return -1;
+ 				}
+ 				if (typeof FS == 'undefined' || !(e.name === 'ErrnoError')) throw e;
+-				___errno_location(e.code);
++				PHPWASM.setErrNo(e.code);
+ 				return -1;
+ 			}
+ 
+@@ -849,7 +864,7 @@ const LibraryExample = {
+ 				try {
+ 					stdinStream = SYSCALLS.getStreamFromFD(stdinChildFd);
+ 				} catch (e) {
+-					___errno_location(ERRNO_CODES.EBADF);
++					PHPWASM.setErrNo(ERRNO_CODES.EBADF);
+ 					return ProcInfo.pid;
+ 				}
+ 				if (!stdinStream?.node) {
+@@ -912,7 +927,7 @@ const LibraryExample = {
+ 						) {
+ 							throw e;
+ 						}
+-						___errno_location(e.errno);
++						PHPWASM.setErrNo(e.errno);
+ 						stopPumpingAndCloseStdin();
+ 					}
+ 				};
+@@ -1183,13 +1198,40 @@ const LibraryExample = {
+ 		 * The async version was originally introduced to support the Memcached and Redis extensions,
+ 		 * and both are only available with JSPI. Asyncify is too difficult to maintain and
+ 		 * it's not getting that upgrade.
++		 *
++		 * Which branch to take is a question about this binary, and it used
++		 * to be answered by asking the *browser*: `"Suspending" in
++		 * WebAssembly` meant "JSPI build". The two agreed only for as long as
++		 * no browser shipped JSPI. Since Chrome did, an Asyncify build
++		 * running in Chrome has taken the branch written for JSPI builds --
++		 * and that branch unwinds the stack, which an Asyncify build cannot
++		 * do from here. The result is the `unreachable` trap that takes down
++		 * every fsockopen(), every https:// stream and every curl_exec() in
++		 * Chrome, while the same binary in Firefox or Safari fails
++		 * gracefully. ASYNCIFY is a build setting and answers the question
++		 * that was actually being asked: 1 for Asyncify, 2 for JSPI.
++		 *
++		 * This makes Chrome behave the way Firefox and Safari already do. The
++		 * connection is not waited for, so a failure surfaces at the first
++		 * read rather than at connect() -- slower than it should be, but PHP
++		 * code can handle it, and an abort it cannot.
+ 		 */
+-		if (!("Suspending" in WebAssembly)) {
++#if ASYNCIFY == 1
++		try {
+ 			var sock = getSocketFromFD(sockfd);
+ 			var info = getSocketAddress(addr, addrlen);
+ 			sock.sock_ops.connect(sock, info.addr, info.port);
+-			return 0;
++		} catch (e) {
++			// An address that cannot be reached has to come back as an
++			// errno. Letting the exception escape surfaces in PHP as an
++			// abort rather than as connect() failing.
++			if (typeof FS == 'undefined' || !(e.name === 'ErrnoError')) {
++				return -ERRNO_CODES.ECONNREFUSED;
++			}
++			return -e.errno;
+ 		}
++		return 0;
++#else
+ 		return Asyncify.handleSleep((wakeUp) => {
+ 			// Get the socket
+ 			let sock;
+@@ -1325,6 +1367,7 @@ const LibraryExample = {
+ 			ws.addEventListener('error', handleError);
+ 			ws.addEventListener('close', handleClose);
+ 		});
++#endif
+ 	},
+ 	wasm_connect__deps: ['$PHPWASM'],
+ 
+-- 
+2.55.0
+

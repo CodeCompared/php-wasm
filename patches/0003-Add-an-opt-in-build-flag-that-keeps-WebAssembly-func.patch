@@ -1,0 +1,62 @@
+From 7d8a47fc0ec6d2ddaf709e02deca9c328ea54eb1 Mon Sep 17 00:00:00 2001
+From: Brandon Zylstra <brandon.zylstra@gmail.com>
+Date: Thu, 20 Aug 2026 00:14:44 -0400
+Subject: [PATCH 3/3] =?UTF-8?q?=F0=9F=94=8D=20Add=20an=20opt-in=20build=20?=
+ =?UTF-8?q?flag=20that=20keeps=20WebAssembly=20function=20names?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A shipping build strips the name section, so when Asyncify traps on
+'unreachable' the stack is a list of bare function indices -- and the
+Dockerfile's own instructions for that trap are to read the stack and add
+every name on it to the ASYNCIFY_ONLY list, which is not possible without
+names.
+
+WITH_FUNCTION_NAMES=yes passes --profiling-funcs. Off by default, because the
+names cost download size.
+---
+ packages/php-wasm/compile/php/Dockerfile | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/packages/php-wasm/compile/php/Dockerfile b/packages/php-wasm/compile/php/Dockerfile
+index 108befd..a5de229 100644
+--- a/packages/php-wasm/compile/php/Dockerfile
++++ b/packages/php-wasm/compile/php/Dockerfile
+@@ -2404,6 +2404,14 @@ COPY ./compile/php/phpwasm-emscripten-library-known-undefined-functions.js /root
+ ARG WITH_SOURCEMAPS
+ ARG WITH_DEBUG
+ ARG STACK_SIZE
++
++# Keep the WebAssembly name section, so a runtime failure names the function
++# it happened in. Off by default because the names cost download size; worth
++# turning on whenever an Asyncify trap has to be diagnosed, since an
++# `unreachable` from an uninstrumented function is otherwise reported as
++# nothing but a function index.
++ARG WITH_FUNCTION_NAMES="no"
++
+ RUN set -euxo pipefail; \
+ 	mkdir -p /build/output; \
+ 	source /root/emsdk/emsdk_env.sh; \
+@@ -2418,6 +2426,10 @@ RUN set -euxo pipefail; \
+ 		echo '' > /root/php_wasm_asyncify.h; \
+ 	fi; \
+ 	export OPTIMIZATION_FLAGS="-O3"; \
++	FUNCTION_NAME_FLAGS=""; \
++	if [ "${WITH_FUNCTION_NAMES}" = "yes" ]; then \
++		FUNCTION_NAME_FLAGS="--profiling-funcs"; \
++	fi; \
+ 	if [ "${WITH_SOURCEMAPS}" = "yes" ] || [ "${WITH_DEBUG}" = "yes" ]; then \
+ 		export OPTIMIZATION_FLAGS="-O0"; \
+ 	fi; \
+@@ -2434,6 +2446,7 @@ RUN set -euxo pipefail; \
+ 		ENVIRONMENT="$EMSCRIPTEN_ENVIRONMENT,worker"; \
+ 	fi; \
+ 	emcc $OPTIMIZATION_FLAGS \
++	$FUNCTION_NAME_FLAGS \
+ 	--js-library /root/phpwasm-emscripten-library.js \
+ 	--js-library /root/phpwasm-emscripten-library-dynamic-linking.js \
+ 	--js-library /root/phpwasm-emscripten-library-known-undefined-functions.js \
+-- 
+2.55.0
+
