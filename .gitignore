@@ -9,3 +9,6 @@ build/
 
 # Probe output
 probe-results*.json
+
+# Staged release output
+release/
