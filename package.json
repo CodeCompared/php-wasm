@@ -7,11 +7,13 @@
   "license": "GPL-2.0-or-later",
   "scripts": {
     "check:prototype": "scripts/check-prototype.sh",
+    "build:php": "scripts/build-php.sh",
     "probe:published": "node test/probe/run-probes.mjs --target published",
     "probe:local": "node test/probe/run-probes.mjs --target local",
-    "test": "scripts/check-prototype.sh && node test/probe/run-probes.mjs --target published"
+    "test": "scripts/check-prototype.sh && node test/probe/run-probes.mjs --target local"
   },
   "devDependencies": {
     "playwright": "^1.49.0"
-  }
+  },
+  "_aboutScripts": "test = check:prototype + probe:local, and needs a build (npm run build:php) to exist first. probe:published is deliberately excluded: it reproduces the defects against the shipped package and therefore exits non-zero on purpose, which is the opposite of a test result."
 }
