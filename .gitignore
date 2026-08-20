@@ -1,0 +1,8 @@
+# Upstream WordPress Playground checkout (2.6 GB, cloned by scripts/clone-upstream.sh)
+upstream/
+
+node_modules/
+dist/
+build/
+*.log
+.DS_Store
