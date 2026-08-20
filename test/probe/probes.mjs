@@ -158,6 +158,82 @@ export const probes = [
 	},
 
 	{
+		name: 'intl-extension',
+		what: 'the intl extension loads on demand and formats numbers and dates',
+		/*
+		 * intl is not compiled into the binary and never will be -- ICU's data
+		 * tables would put several megabytes on every reader who never asks
+		 * for a NumberFormatter. It ships beside the binary as a loadable
+		 * module instead, in both the published package and a local build,
+		 * and a consumer asks for it when the runtime is created.
+		 *
+		 * Not through dl(): PHP scans its .ini files once, at startup, and by
+		 * the time PHP code could call dl() that scan is over.
+		 */
+		extensions: ['intl'],
+		/*
+		 * Everything is reported rather than thrown. A failing intl throws an
+		 * IntlException out of a constructor, which ends the run before any
+		 * of the surrounding facts get printed -- whether the extension
+		 * loaded at all, whether ICU's data file is where ICU looks for it --
+		 * and leaves nothing to work from but "creation failed".
+		 */
+		code: `<?php
+			echo 'loaded=', extension_loaded('intl') ? 'yes' : 'no', "\n";
+			echo 'icu_data_env=', getenv('ICU_DATA') ?: '(unset)', "\n";
+			echo 'icu_version=', defined('INTL_ICU_VERSION') ? INTL_ICU_VERSION : '(none)', "\n";
+			$dataFile = rtrim(getenv('ICU_DATA') ?: '/internal/shared', '/') . '/icudt74l.dat';
+			echo 'data_file=', $dataFile, "\n";
+			echo 'data_file_exists=', file_exists($dataFile) ? 'yes' : 'no', "\n";
+			echo 'data_file_size=', file_exists($dataFile) ? filesize($dataFile) : 0, "\n";
+
+			// The value is computed before anything is printed. Echoing the
+			// label first and then calling $work() would leave a half-written
+			// line behind whenever $work() throws.
+			$report = function (string $label, callable $work): void {
+				try {
+					$value = $work();
+				} catch (Throwable $e) {
+					$value = 'FAILED: ' . $e->getMessage();
+				}
+				echo $label, '=', $value, "\n";
+			};
+
+			$report('number', fn () =>
+				(new NumberFormatter('de-DE', NumberFormatter::DECIMAL))->format(1234567.891));
+			$report('currency', fn () =>
+				(new NumberFormatter('ja-JP', NumberFormatter::CURRENCY))->formatCurrency(1234.5, 'JPY'));
+			$report('date', fn () =>
+				(new IntlDateFormatter('fr-FR', IntlDateFormatter::LONG, IntlDateFormatter::NONE, 'UTC'))
+					->format(new DateTime('2026-08-19 00:00:00', new DateTimeZone('UTC'))));
+			$report('sorted', function () {
+				$words = ['zebra', 'ähly', 'apple'];
+				(new Collator('sv-SE'))->sort($words);
+				return implode(',', $words);
+			});
+			$report('normalized', fn () =>
+				Normalizer::normalize("a\u{0301}", Normalizer::FORM_C) === "\u{00e1}" ? 'yes' : 'no');
+		`,
+		expect: (r) =>
+			r.text.includes('loaded=yes') &&
+			r.text.includes('number=1.234.567,891') &&
+			r.text.includes('date=19 ao') &&
+			r.text.includes('normalized=yes'),
+		known: 'absent from get_loaded_extensions(), but shipped alongside as a loadable module',
+		report: (r) =>
+			Object.fromEntries(
+				r.text
+					.trim()
+					.split('\n')
+					.filter((line) => line.includes('='))
+					.map((line) => {
+						const at = line.indexOf('=');
+						return [line.slice(0, at), line.slice(at + 1).slice(0, 60)];
+					})
+			),
+	},
+
+	{
 		name: 'network-file-get-contents',
 		what: 'an https read fails in a way PHP code can handle',
 		code: `<?php

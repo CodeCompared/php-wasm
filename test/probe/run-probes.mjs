@@ -116,8 +116,16 @@ async function startServer(rootDir) {
 			return;
 		}
 
-		const filePath = join(rootDir ?? '', decodeURIComponent(url.pathname));
-		if (!rootDir || !filePath.startsWith(rootDir) || !existsSync(filePath)
+		// ICU's data file is not in the npm package and not in the build
+		// output either; it lives in the upstream checkout. Serve it by name
+		// so both targets can reach it.
+		let filePath =
+			url.pathname === '/icu.dat'
+				? join(projectRoot, 'upstream/packages/php-wasm/compile/shared/intl/data/icu.dat')
+				: join(rootDir ?? '', decodeURIComponent(url.pathname));
+
+		const allowedRoot = url.pathname === '/icu.dat' ? projectRoot : rootDir;
+		if (!allowedRoot || !filePath.startsWith(allowedRoot) || !existsSync(filePath)
 			|| !statSync(filePath).isFile()) {
 			response.writeHead(404).end('not found');
 			return;
@@ -165,6 +173,51 @@ async function startServer(rootDir) {
 // Where the runtime comes from, for each target
 // ---------------------------------------------------------------------------
 
+/*
+ * Where a loadable extension's .so lives, for each target.
+ *
+ * Both the published package and a local build carry
+ * asyncify/extensions/<name>/<name>.so.  Nothing in the runtime loads it by
+ * default -- a consumer has to ask for it when the runtime is created, which
+ * is why an extension can be present in the package and still absent from
+ * get_loaded_extensions().
+ */
+function extensionUrl(name, origin) {
+	if (options.target === 'published') {
+		return (
+			`https://cdn.jsdelivr.net/npm/@php-wasm/web-8-5@${options.version}` +
+			`/asyncify/extensions/${name}/${name}.so`
+		);
+	}
+	return `${origin}/extensions/${name}/${name}.so`;
+}
+
+/*
+ * What an extension needs beyond its own .so.
+ *
+ * intl is really ICU, and ICU keeps its locale tables in a separate data
+ * file. Without it the extension loads, `NumberFormatter` exists, and
+ * constructing one throws "number formatter creation failed" -- which reads
+ * like a broken build rather than a missing file. The .so is compiled to look
+ * for the name icudt74l.dat, and finds it through the ICU_DATA environment
+ * variable, so both have to be arranged before PHP starts.
+ *
+ * The published npm package ships intl.so and no data file at all, so this
+ * has to be served from somewhere; the upstream repository carries it at
+ * packages/php-wasm/compile/shared/intl/data/icu.dat.
+ */
+const extensionExtras = {
+	intl: (origin) => ({
+		env: { ICU_DATA: '/internal/shared' },
+		// Fetched in the page and handed over as bytes. A caller-supplied
+		// extraFiles takes contents, not locations; the URL-and-vfsPath form
+		// belongs to published manifests, and passing it here stages nothing
+		// and reports no error -- the extension simply loads without its data
+		// and every constructor fails with "creation failed".
+		fetchIntoVfs: { '/internal/shared/icudt74l.dat': `${origin}/icu.dat` },
+	}),
+};
+
 function resolveSources(origin) {
 	if (options.target === 'published') {
 		const v = options.version;
@@ -210,7 +263,7 @@ function resolveSources(origin) {
  * abort has to come back as data, because throwing here would be
  * indistinguishable from the harness itself breaking.
  */
-async function probeInPage({ sources, runs }) {
+async function probeInPage({ sources, runs, extensions }) {
 	const messages = [];
 	try {
 		const [loaderModule, universalModule] = await Promise.all([
@@ -218,7 +271,7 @@ async function probeInPage({ sources, runs }) {
 			import(/* @vite-ignore */ sources.universalUrl),
 		]);
 
-		const runtimeId = await universalModule.loadPHPRuntime(loaderModule, {
+		let emscriptenOptions = {
 			instantiateWasm: (imports, receive) =>
 				WebAssembly.instantiateStreaming(fetch(sources.wasmUrl), imports).then(
 					(made) => {
@@ -226,7 +279,55 @@ async function probeInPage({ sources, runs }) {
 						return made.instance;
 					}
 				),
-		});
+		};
+
+		// An extension is fetched, staged in the PHP virtual filesystem and
+		// named in a generated .ini file, all before PHP starts. There is no
+		// later moment to do it in: the ini scan happens once, at startup,
+		// which is why dl() is not the route.
+		if (extensions?.length) {
+			const resolved = [];
+			for (const extension of extensions) {
+				const { fetchIntoVfs, ...extras } = extension.extras ?? {};
+
+				if (fetchIntoVfs) {
+					const files = {};
+					for (const [vfsPath, url] of Object.entries(fetchIntoVfs)) {
+						const response = await fetch(url);
+						if (!response.ok) {
+							throw new Error(
+								`${extension.name}: could not fetch ${url} ` +
+									`(${response.status})`
+							);
+						}
+						files[vfsPath] = new Uint8Array(await response.arrayBuffer());
+					}
+					extras.extraFiles = { ...extras.extraFiles, files };
+				}
+
+				resolved.push(
+					await universalModule.resolvePHPExtension({
+						phpVersion: sources.phpVersion,
+						name: extension.name,
+						source: {
+							format: 'url',
+							name: extension.name,
+							url: extension.url,
+						},
+						...extras,
+					})
+				);
+			}
+			emscriptenOptions = universalModule.withResolvedPHPExtensions(
+				emscriptenOptions,
+				resolved
+			);
+		}
+
+		const runtimeId = await universalModule.loadPHPRuntime(
+			loaderModule,
+			emscriptenOptions
+		);
 
 		const php = new universalModule.PHP(runtimeId);
 
@@ -273,7 +374,17 @@ async function runProbe(browser, sources, probe) {
 	try {
 		await page.goto(`${sources.origin}/`);
 		outcome = await Promise.race([
-			page.evaluate(probeInPage, { sources: { ...sources }, runs }).then(
+			page
+				.evaluate(probeInPage, {
+					sources: { ...sources },
+					runs,
+					extensions: (probe.extensions ?? []).map((name) => ({
+						name,
+						url: extensionUrl(name, sources.origin),
+						extras: extensionExtras[name]?.(sources.origin),
+					})),
+				})
+				.then(
 				(value) => value,
 				(error) => ({
 					ok: false,
@@ -379,7 +490,11 @@ if (chosen.length === 0) {
 const { server, origin } = await startServer(
 	options.target === 'local' ? options.buildDir : null
 );
-const sources = { ...resolveSources(origin), origin };
+const sources = {
+	...resolveSources(origin),
+	origin,
+	phpVersion: options.phpVersion,
+};
 
 const browser = await chromium.launch({ headless: !options.headed });
 const results = [];
