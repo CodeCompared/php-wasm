@@ -21,6 +21,12 @@
 # Usage:
 #   scripts/build-php.sh              # build PHP 8.5.8, web, asyncify
 #   PHP_VERSION=8.5.8 scripts/build-php.sh
+#   WITH_FUNCTION_NAMES=yes scripts/build-php.sh
+#
+# WITH_FUNCTION_NAMES=yes keeps the WebAssembly name section, so a trap names
+# the function it happened in instead of printing a bare function index.  Use
+# it when diagnosing an Asyncify `unreachable`; the names cost download size,
+# so a shipping build leaves it off.
 #
 # Docker must be running.  The first build takes a long time; later ones reuse
 # Docker's layer cache, and a change to the Asyncify only-list or to
@@ -93,7 +99,8 @@ docker build \
 	--build-arg "EMSCRIPTEN_ENVIRONMENT=web" \
 	--build-arg "WITH_JSPI=no" \
 	--build-arg "WITH_OPCACHE=yes" \
-	--build-arg "STACK_SIZE=1MB"
+	--build-arg "STACK_SIZE=1MB" \
+	--build-arg "WITH_FUNCTION_NAMES=${WITH_FUNCTION_NAMES:-no}"
 
 echo "Extracting the build..."
 mkdir -p "$output_dir"

@@ -123,12 +123,37 @@ async function startServer(rootDir) {
 			return;
 		}
 
+		let body = await readFile(filePath);
+
+		/*
+		 * The loader a fresh build produces opens with
+		 *
+		 *     import dependencyFilename from './8_5_8/php_8_5.wasm';
+		 *
+		 * which is a bundler instruction, not JavaScript a browser can run —
+		 * no browser imports a .wasm file as an ES module. Upstream's npm
+		 * package is published through a bundler that rewrites that line, so
+		 * the published build works in a browser and a locally built one does
+		 * not. Rewriting it to the URL form a bundler would emit is what lets
+		 * the same probes run against both.
+		 */
+		if (extname(filePath) === '.js') {
+			body = Buffer.from(
+				body
+					.toString('utf8')
+					.replace(
+						/^import\s+(\w+)\s+from\s+'([^']+\.wasm)';/m,
+						"const $1 = new URL('$2', import.meta.url).href;"
+					)
+			);
+		}
+
 		response.writeHead(200, {
 			'content-type': contentTypes[extname(filePath)] ?? 'application/octet-stream',
 			// Emscripten's streaming instantiation wants a real length.
-			'content-length': statSync(filePath).size,
+			'content-length': body.length,
 		});
-		response.end(await readFile(filePath));
+		response.end(body);
 	});
 
 	await new Promise((done) => server.listen(0, '127.0.0.1', done));
